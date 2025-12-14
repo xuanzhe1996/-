@@ -9,6 +9,10 @@ export class ClothPhysics {
   constraints: number[]; // [p1_index, p2_index, rest_distance]
   pins: number[]; // Indices of vertices that shouldn't move
   
+  // Interaction State
+  interactionParticleIndex: number | null = null;
+  interactionPosition: THREE.Vector3 = new THREE.Vector3();
+
   constructor(geo: THREE.BufferGeometry, pinIndices: number[]) {
     const posAttribute = geo.attributes.position;
     this.positions = posAttribute.array as Float32Array;
@@ -22,7 +26,6 @@ export class ClothPhysics {
 
   generateConstraints(geo: THREE.BufferGeometry) {
     // Simple grid connectivity constraints based on geometry index
-    // Assuming a structured grid for simplicity, or just neighbor edges
     const index = geo.index;
     if (!index) return;
     
@@ -47,12 +50,44 @@ export class ClothPhysics {
     this.constraints.push(p1, p2, dist);
   }
 
+  // --- Interaction Methods ---
+  startInteraction(index: number) {
+    this.interactionParticleIndex = index;
+    // Sync interaction pos to current
+    this.interactionPosition.set(
+      this.positions[index*3],
+      this.positions[index*3+1],
+      this.positions[index*3+2]
+    );
+  }
+
+  updateInteraction(pos: THREE.Vector3) {
+    this.interactionPosition.copy(pos);
+  }
+
+  endInteraction() {
+    this.interactionParticleIndex = null;
+  }
+  // ---------------------------
+
   update(wind: THREE.Vector3, gravity: number) {
     const count = this.positions.length / 3;
 
     // 1. Integration
     for (let i = 0; i < count; i++) {
       if (this.pins.includes(i)) continue;
+
+      // Interaction Override: If this is the interacted particle, move it directly
+      if (this.interactionParticleIndex === i) {
+          this.positions[i*3] = this.interactionPosition.x;
+          this.positions[i*3+1] = this.interactionPosition.y;
+          this.positions[i*3+2] = this.interactionPosition.z;
+          // Reset velocity effectively by setting prev = current
+          this.prevPositions[i*3] = this.positions[i*3];
+          this.prevPositions[i*3+1] = this.positions[i*3+1];
+          this.prevPositions[i*3+2] = this.positions[i*3+2];
+          continue;
+      }
 
       const idx = i * 3;
       
@@ -77,21 +112,24 @@ export class ClothPhysics {
       this.prevPositions[idx + 2] = z;
 
       // Apply forces
-      // Noise/Turbulence for wind can be added here
       const windFactor = Math.sin(Date.now() * 0.005 + y * 0.1) * 0.5 + 0.5;
 
+      // Standard Gravity (-Y direction)
       this.positions[idx] = x + vx + (wind.x * windFactor) * TIMESTEP * TIMESTEP;
       this.positions[idx + 1] = y + vy + (gravity) * TIMESTEP * TIMESTEP;
       this.positions[idx + 2] = z + vz + (wind.z * windFactor) * TIMESTEP * TIMESTEP;
     }
 
     // 2. Constraints Relaxation
-    // Running multiple iterations makes it stiffer
     for (let k = 0; k < 3; k++) {
       for (let i = 0; i < this.constraints.length; i += 3) {
         const p1 = this.constraints[i];
         const p2 = this.constraints[i + 1];
         const rest = this.constraints[i + 2];
+
+        // If a particle is being interacted with, treat it as having infinite mass (like a pin)
+        const isP1Pinned = this.pins.includes(p1) || this.interactionParticleIndex === p1;
+        const isP2Pinned = this.pins.includes(p2) || this.interactionParticleIndex === p2;
 
         const idx1 = p1 * 3;
         const idx2 = p2 * 3;
@@ -109,13 +147,12 @@ export class ClothPhysics {
         const dz = z2 - z1;
 
         const currDist = Math.sqrt(dx * dx + dy * dy + dz * dz);
-        if (currDist === 0) continue; // prevent div by zero
+        if (currDist === 0) continue; 
 
         const diff = (currDist - rest) / currDist;
         
-        // Inverse mass weighting (assuming equal mass)
-        const w1 = this.pins.includes(p1) ? 0 : 0.5;
-        const w2 = this.pins.includes(p2) ? 0 : 0.5;
+        const w1 = isP1Pinned ? 0 : 0.5;
+        const w2 = isP2Pinned ? 0 : 0.5;
 
         if (w1 + w2 === 0) continue;
 
@@ -123,23 +160,37 @@ export class ClothPhysics {
         const translateY = dy * diff * w1;
         const translateZ = dz * diff * w1;
 
-        if (!this.pins.includes(p1)) {
+        if (!isP1Pinned) {
           this.positions[idx1] += translateX;
           this.positions[idx1 + 1] += translateY;
           this.positions[idx1 + 2] += translateZ;
         }
 
-        if (!this.pins.includes(p2)) {
+        if (!isP2Pinned) {
           this.positions[idx2] -= dx * diff * w2;
           this.positions[idx2 + 1] -= dy * diff * w2;
           this.positions[idx2 + 2] -= dz * diff * w2;
         }
       }
       
-      // Floor constraint (simple)
+      // Floor constraint at Y=0 (The Table Surface)
       for(let i=0; i<count; i++) {
-          if (this.positions[i*3 + 1] < -20) {
-              this.positions[i*3 + 1] = -20;
+          if (this.positions[i*3 + 1] < 0) {
+              this.positions[i*3 + 1] = 0; // Hard stop at table
+              
+              // Simple Friction: If hitting floor, reduce horizontal motion
+              // Current pos has just been set to 0 height.
+              // We also dampen the previous position to simulate friction dragging against the table
+              const friction = 0.9;
+              const ox = this.prevPositions[i*3];
+              const oz = this.prevPositions[i*3+2];
+              
+              const cx = this.positions[i*3];
+              const cz = this.positions[i*3+2];
+              
+              // Apply friction to the velocity implicit in (current - prev)
+              this.prevPositions[i*3] = cx - (cx - ox) * friction;
+              this.prevPositions[i*3+2] = cz - (cz - oz) * friction;
           }
       }
     }

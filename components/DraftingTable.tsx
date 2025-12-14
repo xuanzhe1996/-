@@ -1,293 +1,269 @@
-import React, { useRef, useState } from 'react';
-import { GarmentParams, GarmentType } from '../types';
+import React, { useRef, useState, useMemo, useEffect } from 'react';
+import { Canvas, useThree, ThreeEvent } from '@react-three/fiber';
+import * as THREE from 'three';
+import { Text, Grid } from '@react-three/drei';
+import { GarmentParams, Fold, HanfuGeometryData, InteractionMode } from '../types';
 import { COLORS } from '../constants';
+import { generateHanfuGeometry } from '../services/hanfuGeometry';
+import { OrigamiSolver } from '../services/origamiSolver';
 
 interface DraftingTableProps {
   params: GarmentParams;
   setParams: (p: GarmentParams) => void;
+  folds: Fold[];
+  setFolds: (f: Fold[]) => void;
+  mode: InteractionMode;
+  setMode: (m: InteractionMode) => void;
 }
 
-const DraftingTable: React.FC<DraftingTableProps> = ({ params, setParams }) => {
-  const svgRef = useRef<SVGSVGElement>(null);
-  const [activeDrag, setActiveDrag] = useState<string | null>(null);
+// Internal Component to handle the Scene logic
+const DraftingScene: React.FC<DraftingTableProps & { geometryData: HanfuGeometryData }> = ({ 
+  params, folds, setFolds, mode, geometryData 
+}) => {
+  const meshRef = useRef<THREE.Mesh>(null);
+  const { camera, raycaster, gl } = useThree();
+  
+  // Interaction State
+  const [startPoint, setStartPoint] = useState<{vIdx: number, pos: THREE.Vector3} | null>(null);
+  const [hoverPos, setHoverPos] = useState<THREE.Vector3 | null>(null);
 
-  // Visualization Scale configuration
-  const scale = 2.5; 
-  const centerX = 250;
-  const startY = 80;
-
-  // Calculate collar points
-  const collarHalfW = (params.collarWidth || 18) / 2 * scale;
-
-  // Derive visual coordinates from params
-  const points = {
-    // Shoulders
-    shoulderLeft: { x: centerX - params.sleeveLength / 2 * scale, y: startY, id: 'shoulderLeft' },
-    shoulderRight: { x: centerX + params.sleeveLength / 2 * scale, y: startY, id: 'shoulderRight' },
-    
-    // Neck (Fixed Y, varying X based on collar width)
-    neckLeft: { x: centerX - collarHalfW, y: startY, id: 'neckLeft' },
-    neckRight: { x: centerX + collarHalfW, y: startY, id: 'neckRight' },
-    
-    // Hem
-    hemLeft: { x: centerX - params.waistWidth / 2 * scale * 1.2, y: startY + params.bodyLength * scale, id: 'hemLeft' },
-    hemRight: { x: centerX + params.waistWidth / 2 * scale * 1.2, y: startY + params.bodyLength * scale, id: 'hemRight' },
-    
-    // Underarms
-    underarmLeft: { x: centerX - params.waistWidth / 2 * scale, y: startY + params.sleeveWidth * scale, id: 'underarmLeft' },
-    underarmRight: { x: centerX + params.waistWidth / 2 * scale, y: startY + params.sleeveWidth * scale, id: 'underarmRight' },
-  };
-
-  const handlePointerDown = (id: string, e: React.PointerEvent) => {
-    e.stopPropagation();
-    e.currentTarget.setPointerCapture(e.pointerId);
-    setActiveDrag(id);
-  };
-
-  const handlePointerUp = (e: React.PointerEvent) => {
-    e.currentTarget.releasePointerCapture(e.pointerId);
-    setActiveDrag(null);
-  };
-
-  const handlePointerMove = (e: React.PointerEvent) => {
-    if (!activeDrag || !svgRef.current) return;
-    
-    const clientX = e.clientX;
-    const clientY = e.clientY;
-
-    const CTM = svgRef.current.getScreenCTM();
-    if (!CTM) return;
-    
-    const svgX = (clientX - CTM.e) / CTM.a;
-    const svgY = (clientY - CTM.f) / CTM.d;
-
-    const newParams = { ...params };
-    
-    // Interaction Logic
-    if (activeDrag === 'shoulderLeft' || activeDrag === 'shoulderRight') {
-        const dist = Math.abs(svgX - centerX);
-        newParams.sleeveLength = Math.max(100, Math.min(220, (dist * 2) / scale));
-    } else if (activeDrag === 'hemLeft' || activeDrag === 'hemRight') {
-        const dist = Math.abs(svgX - centerX);
-        newParams.waistWidth = Math.max(30, Math.min(80, (dist * 2) / (scale * 1.2)));
-        
-        const len = svgY - startY;
-        newParams.bodyLength = Math.max(80, Math.min(180, len / scale));
-    } else if (activeDrag === 'underarmLeft' || activeDrag === 'underarmRight') {
-        const dist = Math.abs(svgX - centerX);
-        newParams.waistWidth = Math.max(30, Math.min(80, (dist * 2) / scale));
-
-        const depth = svgY - startY;
-        newParams.sleeveWidth = Math.max(20, Math.min(80, depth / scale));
-    } else if (activeDrag === 'neckLeft' || activeDrag === 'neckRight') {
-        const dist = Math.abs(svgX - centerX);
-        newParams.collarWidth = Math.max(10, Math.min(30, (dist * 2) / scale));
+  // Geometry Setup
+  useEffect(() => {
+    if (meshRef.current) {
+        meshRef.current.geometry.dispose();
+        meshRef.current.geometry = geometryData.geo;
     }
+  }, [geometryData]);
 
-    setParams(newParams);
+  // Animation / Update Loop
+  useEffect(() => {
+     if (meshRef.current && geometryData.basePositions.length > 0) {
+         OrigamiSolver.applyFolds(
+             geometryData.basePositions, 
+             folds, 
+             meshRef.current.geometry.attributes.position as THREE.BufferAttribute
+         );
+         meshRef.current.geometry.computeVertexNormals();
+     }
+  }, [folds, geometryData]);
+
+
+  // --- Interactions ---
+
+  const getIntersect = (e: ThreeEvent<PointerEvent>) => {
+      // Find nearest vertex
+      if (!meshRef.current) return null;
+      const inter = e.intersections.find(i => i.object === meshRef.current);
+      if (!inter) return null;
+
+      // Find closest vertex index
+      const localP = meshRef.current.worldToLocal(inter.point.clone());
+      const pos = meshRef.current.geometry.attributes.position;
+      let minD = Infinity; 
+      let idx = -1;
+      
+      // Optimization: Check only if close (brute force fine for <5k verts)
+      for(let i=0; i<pos.count; i++){
+          const dx = pos.getX(i) - localP.x;
+          const dy = pos.getY(i) - localP.y;
+          const d = dx*dx + dy*dy;
+          if(d < minD) { minD = d; idx = i; }
+      }
+      
+      return { vIdx: idx, point: inter.point, localPoint: new THREE.Vector3(pos.getX(idx), pos.getY(idx), pos.getZ(idx)) };
   };
 
-  // --- Path Generation Logic ---
+  const handlePointerDown = (e: ThreeEvent<PointerEvent>) => {
+      if (mode === 'VIEW') return;
+      e.stopPropagation();
+      const hit = getIntersect(e);
+      if (hit) {
+          // Store raw Base Position for stability, not current folded position
+          const basePos = geometryData.basePositions[hit.vIdx];
+          setStartPoint({ vIdx: hit.vIdx, pos: basePos });
+      }
+  };
 
-  // 1. Silhouette (Common)
-  // Determine Neck Shape based on Type
-  let neckPathPart = `L ${points.neckLeft.x} ${points.neckLeft.y} Q ${centerX} ${points.neckLeft.y + 10} ${points.neckRight.x} ${points.neckRight.y}`; // Default JiaoLing
-  
-  if (params.type === 'YuanLing') {
-      // Deep curve for round collar
-      neckPathPart = `L ${points.neckLeft.x} ${points.neckLeft.y} C ${points.neckLeft.x} ${points.neckLeft.y + 40}, ${points.neckRight.x} ${points.neckRight.y + 40}, ${points.neckRight.x} ${points.neckRight.y}`;
-  } else if (params.type === 'XieJin') {
-      // Standing collar - Draw a small rectangle up then across
-      neckPathPart = `L ${points.neckLeft.x} ${points.neckLeft.y - 15} L ${points.neckLeft.x} ${points.neckLeft.y} L ${points.neckRight.x} ${points.neckRight.y} L ${points.neckRight.x} ${points.neckRight.y - 15}`;
-  }
+  const handlePointerMove = (e: ThreeEvent<PointerEvent>) => {
+      const hit = getIntersect(e);
+      if (hit) setHoverPos(hit.point);
+      else setHoverPos(null);
+  };
 
-  const silhouettePath = `
-    M ${points.shoulderLeft.x} ${points.shoulderLeft.y}
-    ${neckPathPart}
-    L ${points.shoulderRight.x} ${points.shoulderRight.y}
-    L ${points.shoulderRight.x} ${points.shoulderRight.y + params.sleeveWidth * scale}
-    Q ${points.underarmRight.x + 20} ${points.underarmRight.y + 20} ${points.underarmRight.x} ${points.underarmRight.y}
-    L ${points.hemRight.x} ${points.hemRight.y}
-    L ${points.hemLeft.x} ${points.hemLeft.y}
-    L ${points.underarmLeft.x} ${points.underarmLeft.y}
-    Q ${points.underarmLeft.x - 20} ${points.underarmLeft.y + 20} ${points.shoulderLeft.x} ${points.shoulderLeft.y + params.sleeveWidth * scale}
-    Z
-  `;
+  const handlePointerUp = (e: ThreeEvent<PointerEvent>) => {
+      if (!startPoint) return;
+      const hit = getIntersect(e);
+      
+      if (hit && hit.vIdx !== startPoint.vIdx) {
+          const endBasePos = geometryData.basePositions[hit.vIdx];
+          
+          if (mode === 'DRAW_FOLD') {
+              // Create Fold from Line (Start -> End)
+              const axis = new THREE.Vector3().subVectors(endBasePos, startPoint.pos).normalize();
+              const origin = startPoint.pos.clone().add(endBasePos).multiplyScalar(0.5);
+              
+              // Seed strategy: Pick a point far from axis
+              // Simple hack: Pick start point + some offset perpendicular
+              const perp = new THREE.Vector3(-axis.y, axis.x, 0);
+              // Find a vertex that is clearly on one side
+              // We'll iterate to find best seed
+              let seedIdx = -1;
+              let maxDist = -Infinity;
+              
+              const cutNormal = new THREE.Vector3().crossVectors(axis, new THREE.Vector3(0,0,1));
+              
+              for(let i=0; i<geometryData.basePositions.length; i++) {
+                   const v = geometryData.basePositions[i];
+                   const d = (v.x - origin.x)*cutNormal.x + (v.y - origin.y)*cutNormal.y;
+                   if (Math.abs(d) > maxDist) { maxDist = Math.abs(d); seedIdx = i; }
+              }
 
-  // 2. Lapel Paths (Specific)
-  let outerLapelPath = '';
-  let innerLapelPath = '';
-  
-  if (params.type === 'JiaoLing') {
-      // Right Ren (You Ren): Left Panel (Viewer Right) covers Right Panel (Viewer Left)
-      // Visually: Line goes from Viewer Right (Neck) -> Viewer Left (Armpit)
-      outerLapelPath = `
-        M ${points.neckRight.x} ${points.neckRight.y + 5} 
-        Q ${centerX} ${points.underarmLeft.y - 40} ${points.underarmLeft.x + 5} ${points.underarmLeft.y + 10}
-      `;
-      innerLapelPath = `
-        M ${points.neckLeft.x} ${points.neckLeft.y + 5}
-        Q ${centerX} ${points.underarmRight.y - 40} ${points.underarmRight.x - 5} ${points.underarmRight.y + 10}
-      `;
-  } else if (params.type === 'YuanLing') {
-      // Side closure style (Right side / Viewer Left)
-      // Visual line from neck right curve down to armpit left
-      outerLapelPath = `
-        M ${points.neckRight.x - 10} ${points.neckRight.y + 35} 
-        Q ${points.neckRight.x} ${points.neckRight.y + 50} ${points.neckRight.x + 20} ${points.shoulderRight.y + 40}
-        L ${points.underarmLeft.x + 10} ${points.underarmLeft.y - 10}
-      `;
-  } else if (params.type === 'XieJin') {
-      // Slanted: Center Neck -> Right Armpit (Viewer Left)
-      outerLapelPath = `
-        M ${centerX} ${startY}
-        L ${centerX} ${startY + 20}
-        L ${points.underarmLeft.x + 20} ${points.underarmLeft.y - 10}
-      `;
-  }
-
-  // --- Type Switcher UI ---
-  const typeOptions: {id: GarmentType, label: string}[] = [
-      { id: 'JiaoLing', label: '交领' },
-      { id: 'YuanLing', label: '圆领' },
-      { id: 'XieJin', label: '斜襟' },
-  ];
+              if (seedIdx !== -1) {
+                  const indices = OrigamiSolver.computeFoldIndices(geometryData.basePositions, geometryData.neighbors, origin, axis, seedIdx);
+                  if (indices.size > 0) {
+                      const newFold: Fold = {
+                          id: Date.now(),
+                          axis,
+                          origin,
+                          indices,
+                          angle: Math.PI, // 180 degrees default
+                          targetAngle: Math.PI,
+                          inverted: false
+                      };
+                      setFolds([...folds, newFold]);
+                  }
+              }
+          }
+          else if (mode === 'DRAG_FOLD') {
+              // Calculate fold line that maps Start Point to Hit Point (Perpendicular Bisector)
+              const p1 = startPoint.pos;
+              const p2 = endBasePos;
+              const mid = new THREE.Vector3().addVectors(p1, p2).multiplyScalar(0.5);
+              
+              const seg = new THREE.Vector3().subVectors(p2, p1);
+              const axis = new THREE.Vector3(-seg.y, seg.x, 0).normalize();
+              
+              const indices = OrigamiSolver.computeFoldIndices(geometryData.basePositions, geometryData.neighbors, mid, axis, startPoint.vIdx);
+              
+              if (indices.size > 0) {
+                  const newFold: Fold = {
+                      id: Date.now(),
+                      axis,
+                      origin: mid,
+                      indices,
+                      angle: Math.PI,
+                      targetAngle: Math.PI,
+                      inverted: false
+                  };
+                  setFolds([...folds, newFold]);
+              }
+          }
+      }
+      setStartPoint(null);
+  };
 
   return (
-    <div className="w-full h-full relative overflow-hidden bg-[#F9F7F2]">
-      
-      {/* Background Grid */}
-      <div className="absolute inset-0 pointer-events-none opacity-20"
-           style={{
-             backgroundImage: `linear-gradient(${COLORS.grid} 1px, transparent 1px), linear-gradient(90deg, ${COLORS.grid} 1px, transparent 1px)`,
-             backgroundSize: '20px 20px'
-           }} 
-      />
-
-      {/* Title / Watermark & Switcher */}
-      <div className="absolute top-6 left-6 flex flex-col gap-4 z-20">
-        <h2 className="text-2xl font-bold tracking-widest text-[#2B2B2B] opacity-80 select-none" style={{writingMode: 'vertical-rl'}}>
-          制版台
-        </h2>
-      </div>
-
-      <div className="absolute top-6 right-6 z-20 flex flex-col gap-2">
-         {typeOptions.map((opt) => (
-             <button
-                key={opt.id}
-                onClick={() => setParams({...params, type: opt.id})}
-                className={`px-3 py-1 text-xs font-serif border transition-all ${
-                    params.type === opt.id 
-                    ? 'border-[#C44032] text-[#C44032] bg-[#C44032]/5' 
-                    : 'border-transparent text-gray-500 hover:border-gray-300'
-                }`}
-             >
-                 {opt.label}
-             </button>
-         ))}
-      </div>
-
-      <svg 
-        ref={svgRef}
-        className="w-full h-full touch-none"
-        viewBox="0 0 500 800"
-        preserveAspectRatio="xMidYMid meet"
+    <>
+      <mesh 
+        ref={meshRef} 
+        onPointerDown={handlePointerDown} 
+        onPointerMove={handlePointerMove}
+        onPointerUp={handlePointerUp}
       >
-        {/* Shadow/Guideline */}
-        <path d={silhouettePath} stroke="none" fill="#EAE5D9" />
-
-        {/* Construction Lines */}
-        <line x1={centerX} y1={0} x2={centerX} y2={800} stroke={COLORS.grid} strokeDasharray="4 4" />
-        
-        {/* Inner Lapel (Dashed) */}
-        {innerLapelPath && (
-            <path 
-            d={innerLapelPath}
-            stroke={COLORS.ink}
-            strokeWidth="1"
-            fill="none"
-            strokeDasharray="4 4"
-            opacity="0.6"
-            />
-        )}
-
-        {/* Main Outline - Ink Style */}
-        <path 
-          d={silhouettePath} 
-          stroke={COLORS.ink} 
-          strokeWidth="2.5" 
-          fill="none" 
-          strokeLinecap="round"
-          strokeLinejoin="round"
-        />
-
-        {/* Outer Lapel (Solid) */}
-        {outerLapelPath && (
-            <>
-                <path 
-                d={outerLapelPath}
-                stroke="white"
-                strokeWidth="6"
-                fill="none"
-                strokeLinecap="square"
-                className="mix-blend-overlay"
-                />
-                <path 
-                d={outerLapelPath}
-                stroke={COLORS.ink}
-                strokeWidth="2"
-                fill="none"
-                strokeLinecap="round"
-                />
-            </>
-        )}
-
-        {/* Collar Highlight */}
-        {params.type === 'JiaoLing' && (
-             <path 
-             d={`M ${points.neckLeft.x} ${points.neckLeft.y} Q ${centerX} ${points.neckLeft.y + 10} ${points.neckRight.x} ${points.neckRight.y}`}
-             stroke={COLORS.ink}
-             strokeWidth="2"
-             fill="none"
-           />
-        )}
-
-        {/* Measurements / Annotations */}
-        <text x={points.shoulderLeft.x} y={points.shoulderLeft.y - 15} className="text-[8px] fill-gray-500 font-serif">通袖 {Math.round(params.sleeveLength)}</text>
-        <text x={points.hemLeft.x} y={points.hemLeft.y + 20} className="text-[8px] fill-gray-500 font-serif">衣长 {Math.round(params.bodyLength)}</text>
-        <text x={centerX + 5} y={points.neckRight.y - 5} className="text-[6px] fill-gray-400 font-serif">领宽 {Math.round(params.collarWidth)}</text>
-
-        {/* Interactive Anchors */}
-        {[
-            points.shoulderLeft, points.shoulderRight, 
-            points.hemLeft, points.hemRight,
-            points.underarmLeft, points.underarmRight,
-            points.neckLeft, points.neckRight
-        ].map((p, i) => (
-          <circle 
-            key={p.id} 
-            cx={p.x} 
-            cy={p.y} 
-            r={activeDrag === p.id ? 8 : 5} 
-            fill={COLORS.cinnabar}
-            stroke="white"
-            strokeWidth="1"
-            className="cursor-pointer transition-all duration-150 hover:r-7"
-            onPointerDown={(e) => handlePointerDown(p.id, e)}
-            onPointerMove={handlePointerMove}
-            onPointerUp={handlePointerUp}
-            style={{ cursor: 'pointer', touchAction: 'none' }}
-          />
-        ))}
-      </svg>
+        <bufferGeometry />
+        <meshBasicMaterial color="#EAE5D9" side={THREE.DoubleSide} wireframe={false} polygonOffset polygonOffsetFactor={1} />
+        {/* Outline */}
+        <lineSegments>
+            <wireframeGeometry args={[geometryData.geo]} />
+            <lineBasicMaterial color={COLORS.ink} opacity={0.2} transparent />
+        </lineSegments>
+      </mesh>
       
-      {/* Minimalist Legend */}
-      <div className="absolute bottom-4 right-4 text-xs text-gray-500 font-serif space-y-1 text-right select-none pointer-events-none">
-        <p>• 拖拽红点调整版型</p>
-        <p>• 虚线为里襟结构</p>
-      </div>
-    </div>
+      {/* Edges Visual Enhancement */}
+      <mesh scale={[1.001, 1.001, 1.001]}>
+           <bufferGeometry attach="geometry" {...geometryData.geo} />
+           <meshBasicMaterial color={COLORS.ink} wireframe transparent opacity={0.1} />
+      </mesh>
+
+      {/* Interaction Visuals */}
+      {hoverPos && mode !== 'VIEW' && (
+          <mesh position={hoverPos}>
+              <ringGeometry args={[0.3, 0.5, 32]} />
+              <meshBasicMaterial color={mode === 'DRAW_FOLD' ? COLORS.cinnabar : '#3498db'} />
+          </mesh>
+      )}
+      
+      {startPoint && hoverPos && mode === 'DRAW_FOLD' && (
+          <lineSegments>
+              <bufferGeometry onUpdate={(self: THREE.BufferGeometry) => self.setFromPoints([startPoint.pos, hoverPos])} />
+              <lineBasicMaterial color={COLORS.cinnabar} linewidth={2} />
+          </lineSegments>
+      )}
+
+      <Grid args={[100, 100]} cellColor={COLORS.grid} sectionColor={COLORS.grid} fadeDistance={50} />
+    </>
   );
+};
+
+
+// Main Component
+const DraftingTable: React.FC<DraftingTableProps> = (props) => {
+    // Generate geometry once based on params
+    const geometryData = useMemo(() => generateHanfuGeometry(props.params), [props.params]);
+    
+    return (
+        <div className="w-full h-full flex flex-col bg-[#F9F7F2]">
+             {/* Header Bar: Title and Actions */}
+             <div className="flex-shrink-0 h-14 border-b border-[#E5E0D8] px-4 flex items-center justify-between bg-white/50 backdrop-blur-sm">
+                 <h2 className="text-lg font-bold text-gray-800 font-serif">制版与折叠</h2>
+                 <div className="flex gap-2">
+                     <button 
+                        onClick={() => props.setFolds(props.folds.slice(0, -1))}
+                        className="px-3 py-1.5 rounded bg-white border border-gray-300 text-xs text-gray-700 hover:bg-gray-50 transition-colors"
+                     >
+                        撤销
+                     </button>
+                     <button 
+                        onClick={() => props.setFolds([])}
+                        className="px-3 py-1.5 rounded bg-white border border-gray-300 text-xs text-red-600 hover:border-red-300 transition-colors"
+                     >
+                        重置
+                     </button>
+                 </div>
+             </div>
+
+             {/* Canvas Area */}
+             <div className="flex-grow relative overflow-hidden">
+                <Canvas orthographic camera={{ zoom: 15, position: [0, 0, 50] }}>
+                    <ambientLight intensity={0.8} />
+                    <pointLight position={[10, 10, 10]} />
+                    <DraftingScene {...props} geometryData={geometryData} />
+                </Canvas>
+             </div>
+
+             {/* Footer Bar: Tools */}
+             <div className="flex-shrink-0 h-12 border-t border-[#E5E0D8] bg-white/80 flex items-center justify-center gap-6">
+                 <button 
+                    onClick={() => props.setMode('VIEW')} 
+                    className={`flex items-center gap-1.5 px-3 py-1 rounded-full transition-all text-sm ${props.mode === 'VIEW' ? 'bg-blue-50 text-blue-600 font-bold' : 'text-gray-500 hover:text-gray-800'}`}
+                 >
+                     <span>👁</span> 浏览
+                 </button>
+                 <button 
+                    onClick={() => props.setMode('DRAG_FOLD')} 
+                    className={`flex items-center gap-1.5 px-3 py-1 rounded-full transition-all text-sm ${props.mode === 'DRAG_FOLD' ? 'bg-red-50 text-red-600 font-bold' : 'text-gray-500 hover:text-gray-800'}`}
+                 >
+                     <span>🤏</span> 拖拽折叠
+                 </button>
+                 <button 
+                    onClick={() => props.setMode('DRAW_FOLD')} 
+                    className={`flex items-center gap-1.5 px-3 py-1 rounded-full transition-all text-sm ${props.mode === 'DRAW_FOLD' ? 'bg-red-50 text-red-600 font-bold' : 'text-gray-500 hover:text-gray-800'}`}
+                 >
+                     <span>🖊</span> 画线折叠
+                 </button>
+             </div>
+        </div>
+    );
 };
 
 export default DraftingTable;
